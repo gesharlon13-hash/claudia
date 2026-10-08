@@ -1,0 +1,397 @@
+//@version=6
+// =============================================================================
+// Momentum Burst MAX  (2026-09-30)  =  Momentum Burst XE + live position size as a % of the account balance
+// SIGNALS, PRESETS, EXITS AND ALERTS ARE IDENTICAL TO MOMENTUM BURST XE (its notes follow below). New: the 'Live position size'
+// inputs - type this subaccount's balance on the 1st of each month; each position = balance x 30% x the preset's size factor.
+// LIVE-ACCOUNT SIMULATION (2026-09-30, beat_lab ms_trades.py + ms_account.py + ms_run.py) - your real rules, not a model: one Bybit
+// account, $6,500 on 2022-01-01, every coin and trade of this script, position = % of the wallet balance on the 1st of each month x the
+// preset size, 4x isolated margin (an entry is skipped when margin runs out), 0.055% taker per side, real Bybit funding, liquidation check,
+// hourly mark-to-market. 'Shifted' = the same history on bars built 1/4, 1/2 and 3/4 of a bar later. Several presets are fitted to
+// TradingView's exact bar grid, so the shifted grids are the realistic view (TradingView-bar balances since 2022 run into the millions).
+// Max drawdown %: TradingView bars | 3 shifted grids, and the balance on 2026-09-22 on the 3 shifted grids:
+//  pos %  since 2022-01-01 ...................................................... | since 2025-01-01 .................................
+//    15%   DD 11.9 | 12.5 / 17.4 / 18.6   balance $31k / $20k / $45k   | 2025+: DD 11.9 | 12.5 / 13.0 / 18.6  balance $12k / $10k / $14k
+//    18%   DD 13.9 | 14.7 / 20.6 / 21.6   balance $42k / $24k / $64k   | 2025+: DD 13.9 | 14.7 / 15.6 / 21.6  balance $13k / $10k / $17k
+//    20%   DD 15.1 | 16.2 / 22.8 / 23.4   balance $51k / $28k / $82k   | 2025+: DD 15.1 | 16.2 / 17.3 / 23.4  balance $14k / $11k / $18k
+//    23%   DD 17.0 | 18.3 / 26.0 / 26.1   balance $68k / $34k / $117k   | 2025+: DD 17.0 | 18.3 / 19.9 / 26.1  balance $16k / $12k / $21k  <- today
+//    26%   DD 18.7 | 20.4 / 29.0 / 28.5   balance $89k / $41k / $163k   | 2025+: DD 18.7 | 20.4 / 22.3 / 28.5  balance $18k / $12k / $24k
+//    30%   DD 20.9 | 23.0 / 33.1 / 31.5   balance $128k / $52k / $256k   | 2025+: DD 20.9 | 23.0 / 25.6 / 31.5  balance $20k / $14k / $29k  <- recommended
+//    35%   DD 23.4 | 26.2 / 38.0 / 35.0   balance $198k / $69k / $441k   | 2025+: DD 23.4 | 26.2 / 29.8 / 35.0  balance $24k / $15k / $36k
+// RECOMMENDED 30% per position (today 1,500 per 6,500 = 23%): the largest size whose worst shifted-grid drawdown since 2022 stays
+// <= 35% (33.1%; TradingView bars 20.9%). Median shifted balance since 2022 $68k (23%) -> $128k (30%). Sized on 2022-2024 only the
+// same rule also picked 30%, and 2025-26 then stayed <= 31.5%. Slippage barely matters (0.05% extra per fill: worst DD 34.5%).
+// Leverage 4x. Keep it in its own subaccount; with Dip-Rider MAX at 23% both accounts together: worst shifted drawdown 29.3%.
+// =============================================================================
+// =============================================================================
+// Momentum Burst XE  —  Momentum Burst X + a range-low ENGULFING leg that exits after a confirmed bearish engulfing
+//
+// Entry : a momentum burst bar — range > k x ATR(14)[1], close in the top part of its range, close up,
+//         volume > m x SMA(volume,20), above the regime EMA (+ the original confirmations). Short = mirror.
+// NEW   : 1. VOLUME SURGE   the burst bar's volume z-score (50 bars) must exceed v.
+//         2. OI FLOW        side-aware open-interest filter on the burst bar: up-bursts need the OI change
+//                           z-score below Z (short covering pushing price up), down-bursts need it above -Z
+//                           (new shorts piling in). On Momentum Burst's own trades these bursts had PF 2.1-2.4
+//                           in both halves of the data vs 1.4-1.7 for the rest.
+//         3. VOLATILITY GATE ATR% vs its 30-day median above / below a level.
+//         4. BREAKEVEN LOCK after a close >= entry + T x ATR the stop moves to entry + A x ATR.
+// Exit  : ATR target, ATR stop (optional trail), breakeven lock, time exit.
+//
+// HOW THE PRESETS WERE CHOSEN (anti-curve-fit):
+//   Momentum Burst's presets depend on TradingView's exact 4h bar timing: rebuilding the same bars 1-3 hours
+//   later turns SOL +215% (DD 12%) into -68%..+116% (DD up to 86%), LINK +96% into -39..-13%, ENA +153% into
+//   -27..+15%. A Momentum Burst X preset had to beat Momentum Burst on EVERY metric on the TradingView grid AND
+//   on a second, shifted grid, and was kept only if it also won >= 5 of 7 metrics on two further held-out grids.
+//
+// RESULTS vs Momentum Burst (Bybit USDT perps, full history, 0.05%/side, 1x, local Pine mirror):
+// coin  TF  trades     win%        PF         net%         maxDD%     Sharpe     (Momentum Burst X / Momentum Burst)
+// NEAR  4h   80/111  62.5/56.8  2.07/1.55   +206/ +171  17.3/21.3  1.24/0.99
+// HBAR  4h   89/93   60.7/53.8  1.74/1.43   +126/  +79  26.1/29.3  0.77/0.62
+// DOGE  4h  137/134  62.8/58.2  1.70/1.41   +216/ +105  23.0/26.4  1.10/0.77
+// LINK  4h  106/116  84.9/81.0  1.83/1.50   +167/  +96  20.2/23.9  1.30/0.76
+// SUI   4h  167/214  79.0/76.2  2.16/1.51   +296/ +226  12.3/29.3  2.38/1.69
+// AVAX  1h  100/120  79.0/64.2  2.42/1.46   +218/ +177  18.0/27.5  1.44/1.01
+// ENA   1h   70/100  70.0/64.0  2.04/1.47   +175/ +153  12.8/26.2  1.90/1.35
+// Unchanged (Momentum Burst setting kept, nothing robust beat it): ETH (I), SOL (B), ONDO (D), HYPE (F), ZEC (H), PUMPFUN (L) + THETA ARB ZK GRT.
+// 13-coin equal-weight basket: net +636% vs +404%, max DD 6.2% vs 10.1%, Sharpe 3.24 vs 2.48
+// Same basket on held-out shifted bar grid #1: net +125% vs +23%, DD 17.5% vs 22.1%, Sharpe 1.37 vs 0.33
+// Same basket on held-out shifted bar grid #2: net +194% vs +117%, DD 13.5% vs 14.7%, Sharpe 1.77 vs 1.37
+// ---- Top-200 scan coins re-checked 2026-09-28 (new / old, same rules as above) ----
+// ARB    2h   63/85  84.1/68.2  3.60/1.98   +307/ +278  20.9/23.1  2.08/1.66  held-out 7/7 7/7
+// GRT    4h   64/91  64.1/53.8  2.16/1.66   +294/ +250  20.2/29.1  1.22/1.07  held-out 7/7 7/7
+// THETA  4h  114/116 88.6/85.3  3.64/2.20   +320/ +220  22.0/24.3  1.99/1.42  held-out 7/7 6/7
+// ZK: a winner existed on the TradingView bars but failed the held-out bar grids (4/7, 1/7) - unchanged
+// ---- 2026-09-29 upgrade: ideas from Max Gain 4x Multi-Entry (trend legs and 1,008 dip legs tested per coin, 13 coins) ----
+// Trend legs (breakout / Supertrend / MACD / EMA cross) beat Momentum Burst X nowhere (they lower its win rate and PF).
+// A lower-priority DIP leg was kept where it beats the current preset on all 7 metrics on the TradingView grid AND the
+// half-bar-shifted grid, wins >= 5/7 on both held-out grids, and the baskets do not get worse:
+// HBAR  4h  135/89  67.4/60.7  2.56/1.74   +389/ +126  21.6/26.1  1.42/0.77  Sortino 2.96/1.36  held-out 7/7 7/7  size 85.3%
+// ONDO  4h  165/156 77.6/76.9  1.98/1.74   +582/ +313  26.0/26.8  1.91/1.47  Sortino 3.33/2.35  held-out 7/7 7/7  size 100%
+//       (new / current; the leg: close below the lower Bollinger band (20, 2 / 2.5) above EMA200, exit on the first close above SMA5)
+// NEAR, ZEC and HYPE also improved alone, but not together with the rest on every basket line -> not applied.
+//
+// ---- 2026-09-30 NEW VERSION 'XE': a third, lowest-priority ENGULFING leg (beats Momentum Burst X on every line) ----------------
+// Leg: range-low bullish engulfing - previous bar red, this bar green, open <= previous close and close >= previous open,
+//      volume >= m x SMA20(volume) of the previous bars, close in the lower X of the last N-day high-low range, BTC above its EMA 200
+//      (DOGE also needs a body >= 0.5 x ATR). Exit AFTER a confirmed bearish engulfing: a red bar engulfing the previous green body,
+//      then within K bars a close below the lower low of those two bars. Stop 3 x ATR(entry), profit lock after +1 ATR -> entry + 0.25 ATR.
+//      Fires only when neither the burst nor the dip leg fires; same position size as the preset.
+//      ETH, LINK: N 120 days, X 0.33, volume 2.5x, K 5 (ONE shared setting - it also passes on NEAR);  DOGE: N 60, X 0.40, volume 1.5x, K 3.
+//      Size factor for the whole coin: ETH 95%, LINK 95%, DOGE 85% (was 100%).
+// Per coin, TradingView grid, full history (new XE / current Momentum Burst X):
+// coin  TF  trades     win%        PF        net%        maxDD%    Sharpe    Sortino   avg trade%
+// ETH   4h   180/178   62.8/62.4  1.79/1.73  +810/ +734  21.1/27.6 1.69/1.59 3.11/2.91 1.38/1.28  shifted grids 7/7 7/7 7/7
+// LINK  4h   110/107   85.5/85.0  1.96/1.86  +188/ +172  19.1/20.2 1.35/1.32 2.04/1.97 1.06/0.98  shifted grids 7/7 7/7 7/7
+// DOGE  4h   153/138   63.4/62.3  1.97/1.66  +301/ +210  21.7/23.0 1.30/1.08 2.37/1.85 1.18/0.91  shifted grids 7/7 7/7 7/7
+// (shifted grids = half-bar-shifted fit grid / held-out grid 1 / held-out grid 2, metrics won out of 7; the one miss is an exact tie)
+// 13-coin basket, TradingView grid:   net +768% vs +743%, CAGR 43.9 vs 43.2, max DD 5.44% vs 5.69%, Sharpe 3.52 vs 3.48, Sortino 8.06 vs 7.76
+//                 2025+:               net +70% vs +68%, CAGR 35.8 vs 34.8, max DD 5.44% vs 5.69%, Sharpe 3.61 vs 3.55, Sortino 6.79 vs 6.58
+//   half-bar-shifted grid:             net +124% vs +89%, CAGR 14.6 vs 11.4, max DD 19.82% vs 20.85%, Sharpe 1.16 vs 0.95, Sortino 1.53 vs 1.19
+//   held-out grid 1:                   net +172% vs +140%, CAGR 18.4 vs 15.9, max DD 14.35% vs 16.08%, Sharpe 1.56 vs 1.49, Sortino 2.51 vs 2.28
+//   held-out grid 2:                   net +250% vs +227%, CAGR 23.5 vs 22.1, max DD 9.41% vs 13.54%, Sharpe 2.08 vs 1.94, Sortino 3.27 vs 3.00
+// How it was found: 3 rounds of engulfing EXITS on the burst leg (raw, confirmed, profit-only, armed, daily/12h engulfings, stop
+// tightening; ~45,000 variants per coin) never beat Momentum Burst X robustly - the few TradingView-grid wins collapsed on shifted
+// bars, and on NEAR/AVAX the 'wins' came from target/time tweaks, not from the engulfing (ablation). The engulfing ENTRY leg did:
+// 1,600 variants per coin, kept only if 7/7 on the TradingView grid AND the half-bar grid, >= 5/7 on both held-out grids, >= 50% of
+// one-step neighbour settings also passing (LINK: the shared ETH/LINK/NEAR setting instead), then the coin set was chosen so that
+// EVERY basket line improves (NEAR, ZEC also passed alone but lowered the 2025+ basket Sharpe -> not applied).
+// Honest caveat: the leg adds only 3-28 trades per coin over the whole history. Strict walk-forward (settings picked on the first
+// 60% only): ETH 7/7 and DOGE 6/7 metrics better on the unseen last 40% of the TradingView grid, mixed on shifted grids; LINK had no
+// first-60% pick. Unchanged coins (identical to Momentum Burst X): NEAR HBAR SOL ONDO HYPE SUI ZEC AVAX ENA PUMPFUN + scan coins.
+//
+// Needs TradingView open-interest data (<EXCHANGE>:<COIN>USDT.P_OI) only for presets with the OI filter
+// (LINK, THETA); if it is missing that filter simply passes. Use each preset on its own timeframe (table turns red).
+// !! Same coins as Dip-Rider: trade it in its own Bybit SUBACCOUNT (one-way mode nets one position per symbol).
+// =============================================================================
+strategy("Momentum Burst MAX", overlay=true, pyramiding=1,
+     process_orders_on_close=true,
+     commission_type=strategy.commission.percent, commission_value=0.05,
+     initial_capital=10000,
+     default_qty_type=strategy.percent_of_equity, default_qty_value=100,
+     margin_long=25, margin_short=25)   // low margin requirement = no false margin calls; size never exceeds 1x
+
+// ---- Inputs -----------------------------------------------------------------
+preset = input.string("Auto (by symbol)", "Preset", options=["Auto (by symbol)", "ETH", "NEAR", "HBAR", "DOGE", "SOL", "LINK", "ONDO", "HYPE", "SUI", "ZEC", "AVAX", "ENA", "PUMPFUN", "THETA", "ARB", "ZK", "GRT", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "Custom"],
+     tooltip="Auto: the coin's own preset (new ones marked NEW in the code header). A..L = the original Momentum Burst settings.")
+G = "Custom"
+cBoth = input.bool(false,  "Long + Short", group=G)
+cReg  = input.int(200,     "Regime EMA (0 = off)", group=G)
+cK    = input.float(1.5,   "Burst: range > k x ATR", step=0.25, group=G)
+cQ    = input.float(0.7,   "Burst: close in top fraction of bar", step=0.05, group=G)
+cVm   = input.float(2.0,   "Burst: volume > m x SMA20 (0 = off)", step=0.5, group=G)
+cSl   = input.float(4.0,   "Stop (ATR)", step=0.5, group=G)
+cTp   = input.float(1.5,   "Target (ATR)", step=0.25, group=G)
+cTr   = input.float(0.0,   "Trail (ATR, 0 = off)", step=0.5, group=G)
+cMh   = input.int(3,       "Time exit (bars)", group=G)
+cAdx  = input.float(0,     "Confirm: ADX(14) above (0 = off)", group=G)
+cObv  = input.bool(false,  "Confirm: OBV above its EMA20", group=G)
+cAtrC = input.bool(false,  "Confirm: ATR above its SMA50", group=G)
+cHtf  = input.int(0,       "Confirm: close above EMA of this length (0 = off)", group=G)
+cBrk  = input.int(0,       "Confirm: close breaks the N-bar high (0 = off)", group=G)
+cRisk = input.float(0,     "Risk-based sizing: risk % of equity per trade (0 = off)", step=0.01, group=G)
+cVz   = input.float(-99,   "NEW volume z-score above (-99 = off)", step=0.5, group=G)
+cOiK  = input.int(0,       "NEW OI filter: change over k bars (0 = off, 1 or 3)", group=G)
+cOiZ  = input.float(0.5,   "NEW OI filter: z-score threshold Z", step=0.5, group=G)
+cVgM  = input.int(0,       "NEW volatility gate: 0 off, 1 = ATR% ratio >= g, 2 = <= g", group=G)
+cVg   = input.float(1.0,   "NEW volatility gate level g", step=0.1, group=G)
+cBeT  = input.float(0,     "NEW breakeven lock: after T x ATR (0 = off)", step=0.5, group=G)
+cBeA  = input.float(0.25,  "NEW breakeven lock: stop to entry + A x ATR", step=0.05, group=G)
+
+GD = "Data"
+oiOn = input.bool(true, "Use open interest (OI filter)", group=GD, tooltip="Reads <EXCHANGE>:<COIN>USDT.P_OI. Off = the OI filter always passes.")
+btcSym = input.symbol("BYBIT:BTCUSDT.P", "BTC symbol (engulfing leg: BTC above its EMA 200)", group=GD)
+engOn = input.bool(true, "Engulfing leg on (presets that have one)", group=GD)
+
+GS = "Live position size (type your balance on the 1st of each month)"
+accBal  = input.float(0, "Account balance in USDT (0 = backtest sizing: 100% of equity)", minval = 0, step = 100, group = GS,
+     tooltip = "The wallet balance of THIS strategy's Bybit subaccount. Type it on the 1st of every month, then re-create the alert. Each position = balance x the % below x the preset's size factor. That is the position VALUE, not margin (margin = value / leverage; use 4x).")
+accPct  = input.float(40, "Position size, % of account balance", minval = 1, maxval = 100, step = 1, group = GS,
+     tooltip = "40% = the 2026-10-03 three-account plan ($13,000: Dip-Rider 30% @26%, Momentum Burst 40% @40%, Max Gain 30% @4x, reset monthly; combined worst DD ~22% incl. +0.05% slippage; this account alone can draw down ~45%). 30% = the largest size whose worst drawdown since 2022 stayed <= 35% in the live-account simulation (4x, fees, funding; worst of 3 shifted bar grids 33.1%, TradingView bars 20.9%). Today's 1,500 per 6,500 = 23%.")
+liveUsd = input.float(0, "Fixed position size in USDT (overrides the two inputs above when > 0)", minval = 0, step = 50, group = GS,
+     tooltip = "The old way: type the position value directly (the preset's size factor still applies). 0 = use balance x %.")
+float liveSz = liveUsd > 0 ? liveUsd : accBal > 0 ? accBal * accPct / 100.0 : 0.0
+GA = "Bybit webhook (order-fill alerts)"
+tmpl = input.text_area('{"symbol":"{{ticker}}","side":"%SIDE%","qty":"%QTY%","price":"{{close}}","trigger_time":"{{timenow}}","max_lag":"120","strategy_id":"PASTE_YOUR_STRATEGY_ID","amount_type":"%AMT%"}',
+     "Bybit message template (paste yours; keep %SIDE% %AMT% %QTY%)", group=GA)
+msg(string side, bool isExit) =>
+    m = str.replace_all(tmpl, "%SIDE%", side)
+    m := str.replace_all(m, "%AMT%", isExit ? "position.percentage" : "absolute.quantity")
+    str.replace_all(m, "%QTY%", isExit ? "100" : "{{strategy.order.contracts}}")
+mEL = msg("ENTER_LONG", false)
+mXL = msg("EXIT_LONG", true)
+mES = msg("ENTER_SHORT", false)
+mXS = msg("EXIT_SHORT", true)
+
+// ---- Presets ------------------------------------------------------------------
+string b = syminfo.basecurrency
+bool known = b == "ETH" or b == "NEAR" or b == "HBAR" or b == "DOGE" or b == "SOL" or b == "LINK" or b == "ONDO" or b == "HYPE" or b == "SUI" or b == "ZEC" or b == "AVAX" or b == "ENA" or b == "PUMPFUN" or b == "THETA" or b == "ARB" or b == "ZK" or b == "GRT"
+string p = preset == "Auto (by symbol)" ? (known ? b : "Custom") : preset
+// both, regime EMA, k, q, vol mult, stop, target, trail, time-exit bars, TF, ADX min, OBV confirm, risk %, ATR-expanding, HTF-EMA len,
+// breakout len, | NEW: volume-z min (-99 off), OI k (0 off), OI Z, vol-gate mode (0/1/2), vol-gate level, BE trigger (0 off), BE lock, size
+[both, reg, k, q, vm, sl, tp, tr, mh, tfReq, adxMin, obvC, riskPct, atrC, htfLen, brkLen, vzMin, oiK, oiZ, vgM, vgL, beT, beA, sz] = switch p
+    "ETH"      => [true, 400, 1.5, 0.7, 2.0, 4.0, 2.0, 0.0, 12, "240", 0.0, false, 0.0, true, 200, 0, -99.0, 0, 0.0, 0, 0.0, 0.0, 0.0, 0.95]   // = Momentum Burst I (+ engulfing leg 2026-09-30, size 95%)
+    "NEAR"     => [true, 200, 1.5, 0.7, 3.0, 4.0, 1.5, 0.0, 3, "240", 0.0, false, 0.0, false, 0, 0, -99.0, 0, 0.0, 0, 0.0, 1.5, 0.25, 1.0]   // NEW
+    "HBAR"     => [false, 200, 1.25, 0.7, 2.0, 4.0, 1.5, 0.0, 3, "240", 0.0, false, 0.0, false, 0, 0, 1.0, 0, 0.0, 0, 0.0, 1.0, 0.25, 0.853]   // NEW (+ dip leg 2026-09-29)
+    "DOGE"     => [false, 200, 1.5, 0.7, 1.5, 4.0, 1.5, 0.0, 3, "240", 20.0, false, 0.0, false, 0, 0, 0.0, 0, 0.0, 0, 0.0, 1.0, 0.25, 0.85]   // NEW (+ engulfing leg 2026-09-30, size 85%)
+    "SOL"      => [true, 200, 1.0, 0.6, 3.0, 4.0, 0.75, 2.0, 48, "240", 0.0, false, 0.0, false, 0, 0, -99.0, 0, 0.0, 0, 0.0, 0.0, 0.0, 1.0]   // = Momentum Burst B
+    "LINK"     => [true, 200, 1.0, 0.6, 2.0, 4.0, 0.75, 2.0, 48, "240", 20.0, false, 0.0, false, 0, 0, -99.0, 1, 0.0, 2, 1.5, 0.0, 0.0, 0.95]   // NEW (+ engulfing leg 2026-09-30, size 95%)
+    "ONDO"     => [true, 400, 1.0, 0.6, 2.0, 4.0, 1.0, 3.0, 12, "240", 0.0, false, 0.0, false, 0, 0, -99.0, 0, 0.0, 0, 0.0, 0.0, 0.0, 1.0]   // = Momentum Burst D (+ dip leg 2026-09-29)
+    "HYPE"     => [true, 200, 1.0, 0.7, 2.0, 2.0, 0.75, 0.0, 12, "240", 0.0, false, 0.08, false, 0, 0, -99.0, 0, 0.0, 0, 0.0, 0.0, 0.0, 1.0]   // = Momentum Burst F
+    "SUI"      => [true, 400, 1.0, 0.6, 2.0, 4.0, 1.0, 3.0, 12, "240", 0.0, false, 0.08, false, 800, 0, 0.5, 0, 0.0, 1, 0.8, 1.0, 0.1, 1.0]   // NEW
+    "ZEC"      => [false, 100, 1.25, 0.6, 2.0, 2.0, 2.0, 0.0, 12, "240", 20.0, true, 0.04, false, 0, 0, -99.0, 0, 0.0, 0, 0.0, 0.0, 0.0, 1.0]   // = Momentum Burst H
+    "AVAX"     => [false, 200, 2.0, 0.8, 3.0, 4.0, 3.0, 0.0, 48, "60", 0.0, false, 0.0, false, 0, 20, 0.0, 0, 0.0, 0, 0.0, 1.5, 0.25, 1.0]   // NEW
+    "ENA"      => [true, 50, 1.25, 0.7, 3.0, 4.0, 2.0, 3.0, 24, "60", 0.0, false, 0.0, true, 200, 20, 0.5, 0, 0.0, 2, 1.2, 0.0, 0.0, 1.0]   // NEW
+    "PUMPFUN"  => [true, 400, 1.5, 0.7, 2.0, 4.0, 2.0, 0.0, 12, "180", 0.0, false, 0.0, true, 200, 0, -99.0, 0, 0.0, 0, 0.0, 0.0, 0.0, 1.0]   // = Momentum Burst L
+    "THETA"    => [true, 200, 1.25, 0.6, 2.0, 4.0, 0.75, 2.0, 48, "240", 0.0, false, 0.0, false, 0, 0, 1.0, 1, 0.0, 0, 0.0, 0.0, 0.0, 1.0]   // NEW (scan re-check)
+    "ARB"      => [true, 400, 2.5, 0.7, 3.0, 4.0, 2.0, 3.0, 24, "120", 0.0, false, 0.0, true, 800, 0, -99.0, 0, 0.0, 0, 0.0, 1.0, 0.25, 1.0]   // NEW (scan re-check)
+    "ZK"       => [true, 200, 1.0, 0.7, 2.0, 2.0, 0.75, 0.0, 12, "240", 0.0, false, 0.08, false, 0, 0, -99.0, 0, 0.0, 0, 0.0, 0.0, 0.0, 1.0]
+    "GRT"      => [false, 50, 2.0, 0.6, 0.0, 3.0, 3.0, 3.0, 24, "240", 0.0, false, 0.08, true, 0, 0, -99.0, 0, 0.0, 1, 1.0, 0.0, 0.0, 1.0]   // NEW (scan re-check)
+    "A"        => [false, 200, 1.5, 0.7, 2.0, 4.0, 1.5, 0.0, 3, "240", 0.0, false, 0.0, false, 0, 0, -99.0, 0, 0.0, 0, 0.0, 0.0, 0.0, 1.0]
+    "B"        => [true, 200, 1.0, 0.6, 3.0, 4.0, 0.75, 2.0, 48, "240", 0.0, false, 0.0, false, 0, 0, -99.0, 0, 0.0, 0, 0.0, 0.0, 0.0, 1.0]
+    "C"        => [false, 200, 2.0, 0.7, 2.0, 3.0, 0.75, 3.0, 3, "240", 0.0, false, 0.0, false, 0, 0, -99.0, 0, 0.0, 0, 0.0, 0.0, 0.0, 1.0]
+    "D"        => [true, 400, 1.0, 0.6, 2.0, 4.0, 1.0, 3.0, 12, "240", 0.0, false, 0.0, false, 0, 0, -99.0, 0, 0.0, 0, 0.0, 0.0, 0.0, 1.0]
+    "E"        => [false, 100, 1.25, 0.7, 3.0, 4.0, 1.5, 0.0, 12, "60", 0.0, false, 0.0, false, 0, 0, -99.0, 0, 0.0, 0, 0.0, 0.0, 0.0, 1.0]
+    "F"        => [true, 200, 1.0, 0.7, 2.0, 2.0, 0.75, 0.0, 12, "240", 0.0, false, 0.08, false, 0, 0, -99.0, 0, 0.0, 0, 0.0, 0.0, 0.0, 1.0]
+    "G"        => [true, 400, 1.0, 0.6, 2.0, 4.0, 1.0, 3.0, 12, "240", 0.0, false, 0.08, false, 0, 0, -99.0, 0, 0.0, 0, 0.0, 0.0, 0.0, 1.0]
+    "H"        => [false, 100, 1.25, 0.6, 2.0, 2.0, 2.0, 0.0, 12, "240", 20.0, true, 0.04, false, 0, 0, -99.0, 0, 0.0, 0, 0.0, 0.0, 0.0, 1.0]
+    "I"        => [true, 400, 1.5, 0.7, 2.0, 4.0, 2.0, 0.0, 12, "240", 0.0, false, 0.0, true, 200, 0, -99.0, 0, 0.0, 0, 0.0, 0.0, 0.0, 1.0]
+    "J"        => [false, 200, 2.0, 0.6, 3.0, 4.0, 3.0, 0.0, 48, "60", 0.0, false, 0.0, true, 0, 20, -99.0, 0, 0.0, 0, 0.0, 0.0, 0.0, 1.0]
+    "K"        => [true, 50, 1.25, 0.7, 3.0, 4.0, 2.0, 3.0, 24, "60", 0.0, false, 0.0, true, 800, 0, -99.0, 0, 0.0, 0, 0.0, 0.0, 0.0, 1.0]
+    "L"        => [true, 400, 1.5, 0.7, 2.0, 4.0, 2.0, 0.0, 12, "180", 0.0, false, 0.0, true, 200, 0, -99.0, 0, 0.0, 0, 0.0, 0.0, 0.0, 1.0]
+    => [cBoth, cReg, cK, cQ, cVm, cSl, cTp, cTr, cMh, timeframe.period, cAdx, cObv, cRisk, cAtrC, cHtf, cBrk, cVz, cOiK, cOiZ, cVgM, cVg, cBeT, cBeA, 1.0]
+
+// NEW 2026-09-29 (idea from Max Gain 4x Multi-Entry): a second, lower-priority DIP leg - close below the lower Bollinger band
+// (20, k) while above EMA200, exit on the first close above SMA5, no stop, no target. Only presets that beat their old version use it.
+[dOn, dK] = switch p
+    "HBAR" => [true, 2.0]
+    "ONDO" => [true, 2.5]
+    => [false, 2.0]
+
+// NEW 2026-09-30 (version XE): a third, lowest-priority ENGULFING leg - range-low bullish engulfing, exit after a confirmed bearish
+// engulfing. Range days, lower fraction of the range, volume x SMA20 of the previous bars, min body (ATR), confirm window (bars).
+[eOnP, eDays, eX, eVm, eBmin, eK] = switch p
+    "ETH"  => [true, 120, 0.33, 2.5, 0.0, 5]
+    "LINK" => [true, 120, 0.33, 2.5, 0.0, 5]
+    "DOGE" => [true, 60, 0.4, 1.5, 0.5, 3]
+    => [false, 60, 0.5, 1.5, 0.0, 3]
+eOn = engOn and eOnP
+
+// ---- Signals ------------------------------------------------------------------
+atr   = ta.atr(14)
+emaR  = ta.ema(close, math.max(reg, 1))
+volMA = ta.sma(volume, 20)
+[diP, diM, adxV] = ta.dmi(14, 14)
+obv   = ta.obv
+obvUp = obv > ta.ema(obv, 20)
+adxOK = adxMin > 0 ? adxV > adxMin : true
+atrSma = ta.sma(atr, 50)
+atrOK  = not atrC or atr > atrSma
+emaH  = ta.ema(close, math.max(htfLen, 1))
+htfL  = htfLen > 0 ? close > emaH : true
+htfS  = htfLen > 0 ? close < emaH : true
+brkHi = ta.highest(high, math.max(brkLen, 1))[1]
+brkLo = ta.lowest(low, math.max(brkLen, 1))[1]
+brkL  = brkLen > 0 ? close >= brkHi : true
+brkS  = brkLen > 0 ? close <= brkLo : true
+rng   = high - low
+posIn = rng > 0 ? (close - low) / rng : 0.5
+big   = rng > k * atr[1]
+volOK = vm > 0 ? volume > vm * volMA : true
+up    = reg > 0 ? close > emaR : true
+dn    = reg > 0 ? close < emaR : true
+
+// NEW 1: volume z-score of the burst bar (50 bars)
+float vzSd = ta.stdev(volume, 50, false)
+float vzR  = (volume - ta.sma(volume, 50)) / vzSd
+float vz   = na(vzR) ? 0.0 : vzR
+bool  vzOK = vzMin <= -99 or vz > vzMin
+// NEW 2: side-aware open-interest flow on the burst bar (z-score of the k-bar OI change over 500 bars)
+string oiSym = syminfo.prefix + ":" + syminfo.ticker + "_OI"
+float oiReq = request.security(oiSym, timeframe.period, close, ignore_invalid_symbol = true)
+float oiF   = fixnan(oiOn ? oiReq : na)
+var int oiCnt = 0
+if not na(oiF)
+    oiCnt += 1
+float oiX1 = math.log(oiF) - math.log(oiF[1])
+float oiX3 = math.log(oiF) - math.log(oiF[3])
+float oiZ1 = (oiX1 - ta.sma(oiX1, 500)) / ta.stdev(oiX1, 500, false)
+float oiZ3 = (oiX3 - ta.sma(oiX3, 500)) / ta.stdev(oiX3, 500, false)
+float oiz  = oiK == 1 ? (oiCnt >= 501 ? oiZ1 : na) : oiK == 3 ? (oiCnt >= 503 ? oiZ3 : na) : na
+bool  oiL  = oiK == 0 or na(oiz) or oiz < oiZ
+bool  oiS  = oiK == 0 or na(oiz) or oiz > -oiZ
+// NEW 3: volatility gate (ATR% vs its median over 30 days of bars)
+int   vW   = int(30 * 86400 / timeframe.in_seconds())
+float atrp = atr / close
+float med  = ta.median(atrp, vW)
+float vr   = bar_index >= vW + 13 and med > 0 ? atrp / med : 1.0
+bool  vgOK = vgM == 0 or (vgM == 1 ? vr >= vgL : vr <= vgL)
+
+// dip leg (ties with an average resolve as "no signal", exactly like the backtest)
+[bbMid, bbUp, bbLo] = ta.bb(close, 20, dK)
+ema200d = ta.ema(close, 200)
+dipSig  = dOn and close < bbLo * (1 - 1e-9) and close > ema200d
+dipExit = close > ta.sma(close, 5) * (1 + 1e-9)
+
+// engulfing leg: entry = range-low bullish engulfing; exit = confirmed bearish engulfing (computed on every bar, like the backtest)
+btcUp   = request.security(btcSym, timeframe.period, close > ta.ema(close, 200))
+bullEng = close[1] < open[1] and close > open and open <= close[1] and close >= open[1] and (close > open[1] or open < close[1])
+bearEng = close[1] > open[1] and close < open and open >= close[1] and close <= open[1] and (close < open[1] or open > close[1])
+int eNb = int(math.round(eDays * 86400.0 / timeframe.in_seconds()))
+eHi  = ta.highest(high, eNb)
+eLo  = ta.lowest(low, eNb)
+ePos = (close - eLo) / (eHi - eLo)
+engSig = eOn and bullEng and (eVm == 0 or volume >= eVm * volMA[1]) and (eBmin == 0 or math.abs(close - open) >= eBmin * atr) and bar_index >= eNb - 1 and ePos < eX and btcUp
+var int   beBar  = na
+var float beLvl  = na
+var bool  beLive = false
+bool beConf = false
+if beLive
+    if bar_index - beBar > eK
+        beLive := false
+    else if close < beLvl
+        beConf := true
+        beLive := false
+if bearEng
+    beBar  := bar_index
+    beLive := true
+    beLvl  := math.min(low, low[1])
+
+longSig  = big and posIn > q and close > open and volOK and up and adxOK and atrOK and htfL and brkL and (not obvC or obvUp) and vzOK and oiL and vgOK
+shortSig = both and big and posIn < 1 - q and close < open and volOK and dn and adxOK and atrOK and htfS and brkS and (not obvC or not obvUp) and vzOK and oiS and vgOK
+
+// ---- Position management ------------------------------------------------------
+var float stopPx = na
+var float tgtPx  = na
+var float ext    = na
+var float epx    = na
+var float atrE   = na
+var int   leg    = 0        // 1 = momentum burst, 2 = dip leg, 3 = engulfing leg
+pos = strategy.position_size
+
+if pos != 0 and leg == 2
+    if dipExit
+        strategy.close_all(comment = "Dip exit", alert_message = mXL)
+else if pos != 0 and leg == 3
+    if beConf
+        strategy.close_all(comment = "Confirmed bearish engulfing", alert_message = mXL)
+    else
+        if close >= epx + 1.0 * atrE
+            stopPx := math.max(stopPx, epx + 0.25 * atrE)
+        strategy.exit("XL", from_entry = "L", stop = stopPx, comment = stopPx > epx ? "Profit lock" : "Stop", alert_message = mXL)
+else if pos != 0
+    held = bar_index - strategy.opentrades.entry_bar_index(0)
+    if mh > 0 and held >= mh
+        strategy.close_all(comment = "Time exit", alert_message = pos > 0 ? mXL : mXS)
+    else if tr > 0 or beT > 0
+        if pos > 0
+            if tr > 0
+                ext := math.max(ext, close)
+                stopPx := math.max(stopPx, ext - tr * atr)
+            if beT > 0 and close >= epx + beT * atrE
+                stopPx := math.max(stopPx, epx + beA * atrE)
+            strategy.exit("XL", from_entry = "L", stop = stopPx, limit = tgtPx, comment_loss = "Stop", comment_profit = "Target", alert_message = mXL)
+        else
+            if tr > 0
+                ext := math.min(ext, close)
+                stopPx := math.min(stopPx, ext + tr * atr)
+            if beT > 0 and close <= epx - beT * atrE
+                stopPx := math.min(stopPx, epx - beA * atrE)
+            strategy.exit("XS", from_entry = "S", stop = stopPx, limit = tgtPx, comment_loss = "Stop", comment_profit = "Target", alert_message = mXS)
+
+// Entries only when flat (a same-bar time exit blocks re-entry, matching the backtest)
+riskFrac = riskPct > 0 ? math.min(1.0, riskPct / (sl * atr / close)) : 1.0
+baseQty  = sz * (liveSz > 0 ? liveSz / close : strategy.equity / close)
+qtyNow   = riskFrac * baseQty
+
+if pos == 0 and (longSig or shortSig)
+    leg  := 1
+    ext  := close
+    epx  := close
+    atrE := atr
+    if longSig
+        stopPx := close - sl * atr
+        tgtPx  := close + tp * atr
+        strategy.cancel("XL")
+        strategy.entry("L", strategy.long, qty = qtyNow, comment = "Burst long", alert_message = mEL)
+        strategy.exit("XL", from_entry = "L", stop = stopPx, limit = tgtPx, comment_loss = "Stop", comment_profit = "Target", alert_message = mXL)
+    else
+        stopPx := close + sl * atr
+        tgtPx  := close - tp * atr
+        strategy.cancel("XS")
+        strategy.entry("S", strategy.short, qty = qtyNow, comment = "Burst short", alert_message = mES)
+        strategy.exit("XS", from_entry = "S", stop = stopPx, limit = tgtPx, comment_loss = "Stop", comment_profit = "Target", alert_message = mXS)
+else if pos == 0 and dipSig
+    leg    := 2
+    epx    := close
+    stopPx := na
+    tgtPx  := na
+    strategy.cancel("XL")
+    strategy.entry("L", strategy.long, qty = baseQty, comment = "Dip long", alert_message = mEL)
+else if pos == 0 and engSig
+    leg    := 3
+    epx    := close
+    atrE   := atr
+    stopPx := close - 3.0 * atr
+    tgtPx  := na
+    strategy.cancel("XL")
+    strategy.entry("L", strategy.long, qty = baseQty, comment = "Engulfing long", alert_message = mEL)
+    strategy.exit("XL", from_entry = "L", stop = stopPx, comment = "Stop", alert_message = mXL)
+
+// ---- Visuals ------------------------------------------------------------------
+plot(reg > 0 ? emaR : na, "Regime EMA", color = color.new(color.orange, 0))
+plot(pos != 0 ? stopPx : na, "Stop", color = color.red, style = plot.style_linebr)
+plot(pos != 0 ? tgtPx : na, "Target", color = color.lime, style = plot.style_linebr)
+plotshape(longSig and pos == 0, "Burst long", shape.triangleup, location.belowbar, color.aqua, size = size.tiny)
+plotshape(dipSig and pos == 0 and not longSig and not shortSig, "Dip long", shape.circle, location.belowbar, color.new(color.yellow, 0), size = size.tiny)
+plotshape(shortSig and pos == 0, "Burst short", shape.triangledown, location.abovebar, color.fuchsia, size = size.tiny)
+plotshape(engSig and pos == 0 and not longSig and not shortSig and not dipSig, "Engulfing long", shape.diamond, location.belowbar, color.new(color.lime, 0), size = size.tiny)
+plotshape(eOn and bearEng, "Bearish engulfing (engulfing-leg warning)", shape.xcross, location.abovebar, color.new(color.orange, 40), size = size.tiny)
+
+var table info = table.new(position.top_right, 1, 5, bgcolor = color.new(color.black, 20))
+if barstate.islast or barstate.islastconfirmedhistory   // draw right after the chart loads, not only when the live bar closes
+    tfOk = timeframe.period == tfReq
+    table.cell(info, 0, 0, "Momentum Burst MAX  preset: " + p + (both ? " (L+S)" : " (Long)"), text_color = color.white, text_size = size.small)
+    table.cell(info, 0, 1, tfOk ? "Timeframe OK" : "WRONG TIMEFRAME - use " + tfReq + " min", text_color = tfOk ? color.lime : color.red, text_size = size.small)
+    table.cell(info, 0, 3, eOn ? "Engulfing leg ON  (range " + str.tostring(ePos * 100, "#") + "%, buys below " + str.tostring(eX * 100, "#") + "%, BTC " + (btcUp ? "above" : "below") + " EMA 200)" : "Engulfing leg: not used by this preset", text_color = eOn ? color.lime : color.silver, text_size = size.small)
+    table.cell(info, 0, 2, oiK == 0 ? "OI filter: not used by this preset" : "OI data: " + (oiCnt >= 500 ? "OK" : oiCnt > 0 ? "warming up" : "not available - OI filter passes"), text_color = oiK == 0 or oiCnt >= 500 ? color.lime : color.orange, text_size = size.small)
+    table.cell(info, 0, 4, liveSz > 0 ? "Live position: " + str.tostring(math.round(liveSz * sz)) + " USDT" + (liveUsd > 0 ? " (fixed input)" : " = " + str.tostring(accPct) + "% of " + str.tostring(math.round(accBal)) + " x size " + str.tostring(math.round(sz * 100)) + "%") : "Backtest sizing: 100% of equity x size. Live: type your balance", text_color = liveSz > 0 ? color.white : color.silver, text_size = size.small)
+// Live: ONE alert per coin -> "Order fills only", message {{strategy.order.alert_message}}, webhook = the SUBACCOUNT's Bybit URL.
