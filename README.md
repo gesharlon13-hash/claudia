@@ -1,31 +1,41 @@
-# Momentum Burst Max [Ghost Engine]
+# Momentum Burst MAX + Ghost Machine
 
-TradingView Pine Script v5 indicator: `momentum_burst_max.pine`.
-
-It runs on ChartPrime's **Momentum Ghost Machine** engine (MPL-2.0), which uses a
-windowed-sinc low-pass filter for momentum, an MA, a convergence/divergence
-histogram, and a 2-bar "ghost" projection. On top of that it adds burst detection.
-
-## What's added
-
-| Feature | How it works |
+| File | What it is |
 |---|---|
-| **Burst** | The histogram (`momentum - MA`) is measured in standard deviations of its own recent history (`Burst Lookback`). A burst fires when it moves past `Burst Threshold σ` while still accelerating and lined up with momentum polarity. |
-| **MAX Burst** | Fires the first time in a burst leg that the strength beats the strongest reading of the previous `MAX Burst Lookback` bars. |
-| **Exhaustion** | Fires on the first bar the histogram turns against a burst that is still extended. |
-| **Ghost Cross** | An early warning: the projected histogram crosses zero before the real histogram does. |
-| **Ghost Confirmation** | Optional filter. Bursts only count when the projection keeps extending them. |
-| **Cooldown** | Sets the minimum number of bars between two same-direction bursts. |
-| **Chart signals** | Markers on the price chart (`force_overlay`), burst candle coloring, and burst background shading. |
-| **Dashboard** | Shows momentum direction, position vs. MA, burst σ, state, ghost direction, and the last signal. |
-| **Alerts** | One `alertcondition` per signal, plus an "Any alert() function call" alert that covers all of them. |
+| `momentum_burst_max_strategy.pine` | **Momentum Burst MAX** strategy (Pine v6), with the Ghost Machine momentum engine added as an opt-in layer |
+| `momentum_burst_max.pine` | A separate panel indicator that shows the Ghost Machine engine with burst markers. Use it next to the strategy to see what the Ghost filter sees. |
 
-## Engine fixes
+## The upgrade (strategy)
 
-- The ghost-projection linefill is now created once and reused. Before, a new one was created every bar.
-- The momentum fill is now drawn between the main MA and momentum lines, so it still shows with Glow turned off.
+ChartPrime's **Momentum Ghost Machine** engine (MPL-2.0) is ported into the strategy. It computes:
 
-## Usage
+- **Momentum line:** price minus a Blackman-windowed sinc low-pass filter.
+- **MA** of that momentum line.
+- **Histogram:** momentum minus MA.
+- **Ghost:** the histogram projected 2 bars ahead.
 
-Paste `momentum_burst_max.pine` into the TradingView Pine Editor and click **Add to chart**.
-Signals confirm on bar close, so set alerts to "Once Per Bar Close".
+It is used on the **burst leg only**. The dip and engulfing legs are untouched.
+
+| Input (group "Ghost Machine momentum") | Effect |
+|---|---|
+| Entry filter = `Histogram` | Long bursts need histogram > 0. Short bursts need histogram < 0. |
+| Entry filter = `Histogram + ghost` | The histogram and the 2-bar projection must both be on the trade's side. |
+| Entry filter = `Momentum + histogram` | The histogram and the momentum line must both be on the trade's side. |
+| Ghost exit = `Any` / `Only in profit` | Closes a burst trade at the bar close when the projected histogram crosses zero against it. |
+| Mark bursts the Ghost filter blocks | Shows gray triangles where a burst fired but the filter blocked it. |
+
+Rules:
+
+- A burst that the filter blocks still outranks the dip and engulfing legs on that bar. The filter only removes trades and never swaps one trade for another.
+- During warm-up, when there isn't enough data yet, the filter passes. The OI filter works the same way.
+- With both inputs set to **Off** (the default), every signal, preset, exit and alert is identical to Momentum Burst XE.
+
+## Not validated yet
+
+The container this was built in can't reach exchange data, so none of these options has been backtested. Before switching them on live, run them through the same gate as the other upgrades:
+
+- 7/7 metrics on the TradingView grid and on the half-bar-shifted grid
+- At least 5/7 on both held-out grids
+- No basket line gets worse
+
+Sweep the 3 filter modes × 3 exit modes on each coin with the default engine settings first, then try the momentum length in steps of 25–50.

@@ -22,6 +22,14 @@
 // same rule also picked 30%, and 2025-26 then stayed <= 31.5%. Slippage barely matters (0.05% extra per fill: worst DD 34.5%).
 // Leverage 4x. Keep it in its own subaccount; with Dip-Rider MAX at 23% both accounts together: worst shifted drawdown 29.3%.
 // =============================================================================
+// 2026-10-08 GHOST MACHINE UPGRADE (opt-in, NOT YET VALIDATED): the momentum engine of ChartPrime's 'Momentum Ghost Machine'
+// (MPL-2.0, https://mozilla.org/MPL/2.0/) - price minus a Blackman-windowed sinc low-pass filter, an MA of that momentum, their
+// histogram, and the 2-bar 'ghost' projection of the histogram. Two optional uses on the BURST leg only (dip / engulfing legs untouched):
+//   - entry filter: the burst must agree with the Ghost histogram (and optionally its projection or the momentum line)
+//   - ghost exit:   close the burst trade when the projected histogram flips against it
+// Both default to OFF, so with default inputs every signal, preset, exit and alert is IDENTICAL to Momentum Burst XE above.
+// Run it through the same anti-curve-fit gate (TradingView grid + half-bar grid 7/7, held-out grids >= 5/7, basket) before going live.
+// =============================================================================
 // =============================================================================
 // Momentum Burst XE  —  Momentum Burst X + a range-low ENGULFING leg that exits after a confirmed bearish engulfing
 //
@@ -140,6 +148,19 @@ GD = "Data"
 oiOn = input.bool(true, "Use open interest (OI filter)", group=GD, tooltip="Reads <EXCHANGE>:<COIN>USDT.P_OI. Off = the OI filter always passes.")
 btcSym = input.symbol("BYBIT:BTCUSDT.P", "BTC symbol (engulfing leg: BTC above its EMA 200)", group=GD)
 engOn = input.bool(true, "Engulfing leg on (presets that have one)", group=GD)
+
+GG = "Ghost Machine momentum (burst leg only; Off + Off = identical to XE)"
+gFilt  = input.string("Off", "Entry filter", options=["Off", "Histogram", "Histogram + ghost", "Momentum + histogram"], group=GG,
+     tooltip="Off: unchanged. Histogram: longs need the Ghost histogram (momentum - MA) > 0, shorts < 0. Histogram + ghost: also the 2-bar projected histogram on the same side. Momentum + histogram: also the momentum line itself above / below zero. Missing data (warm-up) passes, like the OI filter.")
+gExit  = input.string("Off", "Ghost exit", options=["Off", "Any", "Only in profit"], group=GG,
+     tooltip="Closes a burst trade at the bar close when the 2-bar projected histogram crosses zero against it (longs: crosses below 0). 'Only in profit' = only while close is beyond the entry price. Stop, target, trail and time exit keep working.")
+gLen   = input.int(50, "Momentum Length", minval = 1, group=GG)
+gSm    = input.float(50, "Momentum Smoothing", minval = 1, group=GG)
+gPost  = input.int(4, "Post Smoothing", minval = 1, group=GG)
+gPostS = input.string("WMA", "Post Smoothing Style", options=["EMA", "DEMA", "TEMA", "WMA", "SMA"], group=GG)
+gMaLen = input.int(24, "MA Length", minval = 2, group=GG)
+gMaS   = input.string("EMA", "MA Style", options=["EMA", "DEMA", "TEMA", "WMA", "SMA"], group=GG)
+gShow  = input.bool(true, "Mark bursts the Ghost filter blocks", group=GG)
 
 GS = "Live position size (type your balance on the 1st of each month)"
 accBal  = input.float(0, "Account balance in USDT (0 = backtest sizing: 100% of equity)", minval = 0, step = 100, group = GS,
@@ -295,8 +316,80 @@ if bearEng
     beLive := true
     beLvl  := math.min(low, low[1])
 
-longSig  = big and posIn > q and close > open and volOK and up and adxOK and atrOK and htfL and brkL and (not obvC or obvUp) and vzOK and oiL and vgOK
-shortSig = both and big and posIn < 1 - q and close < open and volOK and dn and adxOK and atrOK and htfS and brkS and (not obvC or not obvUp) and vzOK and oiS and vgOK
+// NEW 2026-10-08: Ghost Machine momentum engine (ChartPrime, MPL-2.0). Same math as the indicator; the sinc convolution
+// (a 1-row Toeplitz matrix product in the original) is written as the equivalent dot product.
+gmSinc(float x) => x == 0 ? 1.0 : math.sin(math.pi * x) / (math.pi * x)
+gmBlackman(float n, int len) => 0.42 - 0.5 * math.cos((2 * math.pi * n) / (len - 1)) + 0.08 * math.cos((4 * math.pi * n) / (len - 1))
+gmCoefs(simple int len, float fc) =>
+    float[] c = array.new<float>()
+    int mid = int((len - 1) / 2)
+    float cutoff = 1 / fc
+    for i = 0 to len - 1
+        c.push(gmSinc(2 * cutoff * (i - mid)) * gmBlackman(len % 2 == 0 ? i + 0.5 : i, len))
+    c
+gmLti(series float src, simple int len, simple float fc) =>
+    var float[] data = array.new<float>()
+    var float[] c = gmCoefs(len, fc)
+    var float norm = c.sum()
+    data.unshift(src)
+    if data.size() > len
+        data.pop()
+    float acc = 0.0
+    if bar_index > len
+        for i = 0 to len - 1
+            acc += c.get(i) * data.get(i)
+    bar_index > len ? acc / norm : na
+gmEma(series float src, simple float len) =>
+    float alpha = 2.0 / (len + 1)
+    var float s = na
+    s := alpha * src + (1.0 - alpha) * nz(s[1], src)
+gmDema(series float src, simple float len) =>
+    float e1 = gmEma(src, len)
+    float e2 = gmEma(e1, len)
+    2.0 * e1 - e2
+gmTema(series float src, simple float len) =>
+    float e1 = gmEma(src, len)
+    float e2 = gmEma(e1, len)
+    float e3 = gmEma(e2, len)
+    (e1 - e2) * 3.0 + e3
+gmWma(series float src, simple int len) =>
+    var float wsum = len * 0.5 * (len + 1)
+    float s = 0.0
+    for int i = 0 to len - 1
+        s += src[i] * (len - i)
+    s / wsum
+gmSma(series float src, simple int len) =>
+    float s = ta.cum(src)
+    bar_index < len - 1 ? s / (bar_index + 1) : (s - s[len]) / len
+gmFilter(series float src, simple int len, simple string style) =>
+    if len > 1
+        switch style
+            "EMA"  => gmEma(src, len)
+            "DEMA" => gmDema(src, len)
+            "TEMA" => gmTema(src, len)
+            "WMA"  => gmWma(src, len)
+            =>        gmSma(src, len)
+    else
+        src
+
+int   gWin   = gLen * 2
+float gSincV = gmLti(close, gWin, gSm)
+float gDelta = gmFilter((close - gSincV) / math.max(int((gWin - 1) / 2), 1), gPost, gPostS)   // Ghost 'Momentum' line
+float gProj  = math.avg(gDelta - gDelta[1], (gDelta - gDelta[2]) / 2)
+float gMa    = gmFilter(gmFilter(gDelta, 2, gMaS), gMaLen, gMaS)                                // Ghost 'MA' line
+float gMaPr  = math.avg(gMa - gMa[1], (gMa - gMa[2]) / 2)
+float gHist  = gDelta - gMa                                                                     // Ghost histogram
+float gGhost = (gDelta + 2 * gProj) - (gMa + 2 * gMaPr)                                         // 2-bar projected histogram (d2)
+bool  gReady = not na(gHist) and not na(gGhost)
+bool  gL = gFilt == "Off" or not gReady or (gFilt == "Histogram" ? gHist > 0 : gFilt == "Histogram + ghost" ? gHist > 0 and gGhost > 0 : gDelta > 0 and gHist > 0)
+bool  gS = gFilt == "Off" or not gReady or (gFilt == "Histogram" ? gHist < 0 : gFilt == "Histogram + ghost" ? gHist < 0 and gGhost < 0 : gDelta < 0 and gHist < 0)
+bool  gDnX = ta.crossunder(gGhost, 0)
+bool  gUpX = ta.crossover(gGhost, 0)
+
+longRaw  = big and posIn > q and close > open and volOK and up and adxOK and atrOK and htfL and brkL and (not obvC or obvUp) and vzOK and oiL and vgOK
+shortRaw = both and big and posIn < 1 - q and close < open and volOK and dn and adxOK and atrOK and htfS and brkS and (not obvC or not obvUp) and vzOK and oiS and vgOK
+longSig  = longRaw and gL
+shortSig = shortRaw and gS
 
 // ---- Position management ------------------------------------------------------
 var float stopPx = na
@@ -319,8 +412,11 @@ else if pos != 0 and leg == 3
         strategy.exit("XL", from_entry = "L", stop = stopPx, comment = stopPx > epx ? "Profit lock" : "Stop", alert_message = mXL)
 else if pos != 0
     held = bar_index - strategy.opentrades.entry_bar_index(0)
+    bool gOut = gExit != "Off" and (pos > 0 ? gDnX and (gExit == "Any" or close > epx) : gUpX and (gExit == "Any" or close < epx))
     if mh > 0 and held >= mh
         strategy.close_all(comment = "Time exit", alert_message = pos > 0 ? mXL : mXS)
+    else if gOut
+        strategy.close_all(comment = "Ghost exit", alert_message = pos > 0 ? mXL : mXS)
     else if tr > 0 or beT > 0
         if pos > 0
             if tr > 0
@@ -359,14 +455,14 @@ if pos == 0 and (longSig or shortSig)
         strategy.cancel("XS")
         strategy.entry("S", strategy.short, qty = qtyNow, comment = "Burst short", alert_message = mES)
         strategy.exit("XS", from_entry = "S", stop = stopPx, limit = tgtPx, comment_loss = "Stop", comment_profit = "Target", alert_message = mXS)
-else if pos == 0 and dipSig
+else if pos == 0 and dipSig and not longRaw and not shortRaw   // a burst blocked by the Ghost filter still outranks the lower legs
     leg    := 2
     epx    := close
     stopPx := na
     tgtPx  := na
     strategy.cancel("XL")
     strategy.entry("L", strategy.long, qty = baseQty, comment = "Dip long", alert_message = mEL)
-else if pos == 0 and engSig
+else if pos == 0 and engSig and not longRaw and not shortRaw
     leg    := 3
     epx    := close
     atrE   := atr
@@ -381,12 +477,14 @@ plot(reg > 0 ? emaR : na, "Regime EMA", color = color.new(color.orange, 0))
 plot(pos != 0 ? stopPx : na, "Stop", color = color.red, style = plot.style_linebr)
 plot(pos != 0 ? tgtPx : na, "Target", color = color.lime, style = plot.style_linebr)
 plotshape(longSig and pos == 0, "Burst long", shape.triangleup, location.belowbar, color.aqua, size = size.tiny)
-plotshape(dipSig and pos == 0 and not longSig and not shortSig, "Dip long", shape.circle, location.belowbar, color.new(color.yellow, 0), size = size.tiny)
+plotshape(dipSig and pos == 0 and not longRaw and not shortRaw, "Dip long", shape.circle, location.belowbar, color.new(color.yellow, 0), size = size.tiny)
 plotshape(shortSig and pos == 0, "Burst short", shape.triangledown, location.abovebar, color.fuchsia, size = size.tiny)
-plotshape(engSig and pos == 0 and not longSig and not shortSig and not dipSig, "Engulfing long", shape.diamond, location.belowbar, color.new(color.lime, 0), size = size.tiny)
+plotshape(engSig and pos == 0 and not longRaw and not shortRaw and not dipSig, "Engulfing long", shape.diamond, location.belowbar, color.new(color.lime, 0), size = size.tiny)
 plotshape(eOn and bearEng, "Bearish engulfing (engulfing-leg warning)", shape.xcross, location.abovebar, color.new(color.orange, 40), size = size.tiny)
+plotshape(gShow and longRaw and not longSig and pos == 0, "Burst long blocked by Ghost", shape.triangleup, location.belowbar, color.new(color.gray, 40), size = size.tiny)
+plotshape(gShow and shortRaw and not shortSig and pos == 0, "Burst short blocked by Ghost", shape.triangledown, location.abovebar, color.new(color.gray, 40), size = size.tiny)
 
-var table info = table.new(position.top_right, 1, 5, bgcolor = color.new(color.black, 20))
+var table info = table.new(position.top_right, 1, 6, bgcolor = color.new(color.black, 20))
 if barstate.islast or barstate.islastconfirmedhistory   // draw right after the chart loads, not only when the live bar closes
     tfOk = timeframe.period == tfReq
     table.cell(info, 0, 0, "Momentum Burst MAX  preset: " + p + (both ? " (L+S)" : " (Long)"), text_color = color.white, text_size = size.small)
@@ -394,4 +492,7 @@ if barstate.islast or barstate.islastconfirmedhistory   // draw right after the 
     table.cell(info, 0, 3, eOn ? "Engulfing leg ON  (range " + str.tostring(ePos * 100, "#") + "%, buys below " + str.tostring(eX * 100, "#") + "%, BTC " + (btcUp ? "above" : "below") + " EMA 200)" : "Engulfing leg: not used by this preset", text_color = eOn ? color.lime : color.silver, text_size = size.small)
     table.cell(info, 0, 2, oiK == 0 ? "OI filter: not used by this preset" : "OI data: " + (oiCnt >= 500 ? "OK" : oiCnt > 0 ? "warming up" : "not available - OI filter passes"), text_color = oiK == 0 or oiCnt >= 500 ? color.lime : color.orange, text_size = size.small)
     table.cell(info, 0, 4, liveSz > 0 ? "Live position: " + str.tostring(math.round(liveSz * sz)) + " USDT" + (liveUsd > 0 ? " (fixed input)" : " = " + str.tostring(accPct) + "% of " + str.tostring(math.round(accBal)) + " x size " + str.tostring(math.round(sz * 100)) + "%") : "Backtest sizing: 100% of equity x size. Live: type your balance", text_color = liveSz > 0 ? color.white : color.silver, text_size = size.small)
+    gOn = gFilt != "Off" or gExit != "Off"
+    gState = not gReady ? "warming up" : "histogram " + (gHist > 0 ? "bullish" : "bearish") + ", ghost " + (gGhost > gHist ? "expanding" : "contracting")
+    table.cell(info, 0, 5, gOn ? "Ghost Machine: filter " + gFilt + ", exit " + gExit + "  (" + gState + ")" : "Ghost Machine: off (identical to XE)  (" + gState + ")", text_color = gOn ? color.aqua : color.silver, text_size = size.small)
 // Live: ONE alert per coin -> "Order fills only", message {{strategy.order.alert_message}}, webhook = the SUBACCOUNT's Bybit URL.
