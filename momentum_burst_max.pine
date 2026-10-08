@@ -1,0 +1,456 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// Momentum engine: "Momentum Ghost Machine" © ChartPrime, used under MPL-2.0.
+// Momentum Burst Max: burst detection, MAX bursts, exhaustion, ghost crosses, alerts and dashboard on top of that engine.
+
+//@version=5
+indicator("Momentum Burst Max [Ghost Engine]", "MBM Ghost", overlay = false, explicit_plot_zorder = true)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Momentum engine (Momentum Ghost Machine)
+// ─────────────────────────────────────────────────────────────────────────────
+
+method is_even(simple int n)=> n % 2 == 0
+sinc(float x)=> x == 0 ? 1 : math.sin(math.pi * x) / (math.pi * x)
+blackman(float n, int length)=> 0.42 - 0.5 * math.cos((2 * math.pi * n) / (length - 1)) + 0.08 * math.cos((4 * math.pi * n) / (length - 1))
+mid_point(int x)=> (x - 1) / 2
+offset(simple int length)=> (length - 1) / 2
+
+get_data(float source, simple int length)=>
+    var float[] data = array.new<float>()
+    if data.size() < length
+        data.unshift(source)
+        data
+
+    else
+        data.unshift(source)
+        data.pop()
+        data
+
+sinc_coefficients(simple int length, float fc)=>
+    float[] coefficients = array.new<float>()
+    int mid = mid_point(length)
+    float cutoff = 1 / fc
+    for i = 0 to length - 1
+        int n = i - mid
+        int k = i
+        int M = length
+        if length.is_even()
+            float coefficient = sinc(2 * cutoff * n) * blackman(k + 0.5, M)
+            coefficients.push(coefficient)
+        else
+            float coefficient = sinc(2 * cutoff * n) * blackman(k, M)
+            coefficients.push(coefficient)
+    coefficients
+
+toeplitz_matrix_valid(float[] coefficients, int M)=>
+    int N = coefficients.size()
+    int rows = M - N + 1
+    matrix<float> toeplitz = matrix.new<float>(rows, M, 0)
+
+    for r = 0 to rows - 1
+        for c = 0 to N - 1
+            if (c + r) < M
+                toeplitz.set(r, c + r, coefficients.get(c))
+            else
+                break
+
+    toeplitz
+
+convolution(float[] data, float[] coefficients)=>
+    var float normalize = coefficients.sum()
+    var matrix<float> toeplitz_matrix = toeplitz_matrix_valid(coefficients, data.size())
+    float convolved = matrix.mult(toeplitz_matrix, data).first()
+    convolved / normalize
+
+lti_sinc(series float source, simple int length, simple float fc = 100)=>
+    float[] data = get_data(source, length)
+    var float[] coefficients = sinc_coefficients(length, fc)
+
+    if bar_index > length
+        convolved = convolution(data, coefficients)
+    else
+        float(na)
+
+ema(series float source, simple float length)=>
+    float alpha = 2.0 / (length + 1)
+    var float smoothed = na
+    smoothed := alpha * source + (1.0 - alpha) * nz(smoothed[1], source)
+
+dema(series float source, simple float length)=>
+    float ema1 = ema(source, length)
+    float ema2 = ema(ema1, length)
+    2.0 * ema1 - ema2
+
+tema(series float source, simple float length)=>
+    float ema1 = ema(source, length)
+    float ema2 = ema(ema1, length)
+    float ema3 = ema(ema2, length)
+    (ema1 - ema2) * 3.0 + ema3
+
+wma(series float source, simple int length)=>
+    var float weight_sum = length * 0.5 * (length + 1)
+    float sum = 0.0
+    for int i=0 to length - 1
+        sum += source[i] * (length - i)
+    sum / weight_sum
+
+sma(series float source, simple int length)=>
+    float sum = ta.cum(source)
+    if bar_index < length - 1
+        sum / (bar_index + 1)
+    else
+        (sum - sum[length]) / length
+
+filter(series float source, simple int length, simple string style)=>
+    if length > 1
+        switch style
+            "EMA"  =>  ema(source, length)
+            "DEMA" => dema(source, length)
+            "TEMA" => tema(source, length)
+            "WMA"  =>  wma(source, length)
+            =>         sma(source, length)
+    else
+        source
+
+color_changer(color source, bool direction)=>
+    float r = color.r(source)
+    float g = color.g(source)
+    float b = color.b(source)
+    if direction
+        color.rgb((255 - r) / 3 + r, (255 - g) / 3 + g, (255 - b) / 3 + b)
+    else
+        color.rgb(r / 1.5, g / 1.5, b / 1.5)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Inputs
+// ─────────────────────────────────────────────────────────────────────────────
+
+const string settings = "Settings"
+float source = input.source(close, "Source", group = settings)
+int momentum_length = input.int(50, "Momentum Length", minval = 1, group = settings)
+float momentum_smoothing = input.float(50, "Momentum Smoothing", tooltip = "Adjust the level of smoothing for the momentum length. The longer the momentum length the more you can smooth it.", minval = 1, group = settings)
+int post_smoothing = input.int(4, "Post Smoothing", minval = 1, tooltip = "Adjust the level of smoothing for the indicator.", group = settings)
+string post_smoothing_style = input.string("WMA", "Post Smoothing Style", ["EMA", "DEMA", "TEMA", "WMA", "SMA"], group = settings)
+int ma_length = input.int(24, "MA Length", minval = 2, group = settings)
+string ma_style = input.string("EMA", "MA Style", ["EMA", "DEMA", "TEMA", "WMA", "SMA"], group = settings)
+
+const string burst_group = "Burst Detection"
+bool enable_burst = input.bool(true, "Enable Burst Signals", group = burst_group)
+int burst_length = input.int(100, "Burst Lookback", minval = 10, group = burst_group
+ , tooltip = "Window used to measure the normal size of the convergence/divergence histogram. A burst is a move that is large relative to this window.")
+float burst_threshold = input.float(1.5, "Burst Threshold (σ)", minval = 0.1, step = 0.1, group = burst_group
+ , tooltip = "How many standard deviations the histogram must reach to count as a burst. Lower = more signals, higher = only the strongest moves.")
+int max_lookback = input.int(50, "MAX Burst Lookback", minval = 5, group = burst_group
+ , tooltip = "A burst is flagged as MAX the first time its strength beats the strongest reading of the previous N bars.")
+int burst_cooldown = input.int(5, "Signal Cooldown (bars)", minval = 0, group = burst_group
+ , tooltip = "Minimum bars between two burst signals in the same direction.")
+bool require_trend = input.bool(true, "Require Momentum Alignment", group = burst_group
+ , tooltip = "Bull bursts need momentum above zero, bear bursts need momentum below zero.")
+bool require_ghost = input.bool(false, "Require Ghost Confirmation", group = burst_group
+ , tooltip = "Only signal when the 2-bar ghost projection keeps extending the burst. Needs Ghost Mode enabled.")
+bool show_exhaustion = input.bool(true, "Show Exhaustion", group = burst_group
+ , tooltip = "Marks the first bar a burst loses steam (histogram turns against the burst while still extended).")
+bool show_ghost_cross = input.bool(true, "Show Ghost Crosses", group = burst_group
+ , tooltip = "Early warning: the projected histogram crosses zero before the real histogram does.")
+
+const string style = "Style"
+bool enable_projection = input.bool(true, "Ghost Mode", group = style)
+int cd_alpha = input.int(25, "MA Difference Alpha", minval = 0, maxval = 100, group = style)
+string candle_color_style = input.string("Both", "Candle Color Style", ["MA", "Direct", "Both", "None"]
+ , tooltip = "MA: Use the moving average convergance divergance to color the candles."
+ + "\n\n" + "Direct: Use the momentum as a source of color. When the momentum is positive it will be the bullish color and when its negative it will be the bearish color."
+ + "\n\n" + "Both: Color the candles bassed on the ma and the polarity of the momentum. The bullish color will be darker if the momentum is negative and the bearish color will be lighter if the momentum is positive."
+ + "\n\n" + "None: Dont color the candles.", group = style)
+bool burst_candles = input.bool(true, "Burst Candle Override", group = style, tooltip = "Force the strongest bull/bear color on candles while a burst is active.")
+bool highlight_burst_bg = input.bool(true, "Highlight Burst Background", group = style)
+bool show_chart_signals = input.bool(true, "Show Signals On Price Chart", group = style)
+
+color momentum_color = input.color(#ffffff, "Momentum Color", group = style)
+color ma_color = input.color(#f7a000, "MA Color", group = style)
+color cd_up_over = input.color(#2ac075, "Bullish Up", group = style)
+color cd_up_under = input.color(#d5fce9, "Bullish Down", group = style)
+color cd_down_under = input.color(#f82934, "Bearish Down", group = style)
+color cd_down_over = input.color(#ffc8cb, "Bearish Up", group = style)
+color ghost_color = input.color(#9c7bff, "Ghost Cross Color", group = style)
+bool glow = input.bool(true, "Glow", group = style)
+
+const string dash_group = "Dashboard"
+bool show_dashboard = input.bool(true, "Show Dashboard", group = dash_group)
+string dashboard_pos = input.string("Top Right", "Position", ["Top Right", "Top Left", "Bottom Right", "Bottom Left"], group = dash_group)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Momentum
+// ─────────────────────────────────────────────────────────────────────────────
+
+int length_correction = momentum_length * 2
+float sinc = lti_sinc(source, length_correction, momentum_smoothing)
+int offset = offset(length_correction)
+float delta = filter((source - sinc) / offset, post_smoothing, post_smoothing_style)
+float projection = math.avg(delta - delta[1], (delta - delta[2]) / 2)
+float ma = filter(filter(delta, 2, ma_style), ma_length, ma_style)
+float ma_project = math.avg(ma - ma[1], (ma - ma[2]) / 2)
+
+float momo = delta - ma
+var color momo_color = na
+if momo > 0
+    if momo > momo[1]
+        momo_color := cd_up_over
+    else
+        momo_color := cd_up_under
+else
+    if momo < momo[1]
+        momo_color := cd_down_under
+    else
+        momo_color := cd_down_over
+
+var color direct_color = na
+
+if candle_color_style == "Both"
+    if delta > 0
+        if momo < 0
+            direct_color := color_changer(momo_color, true)
+        else
+            direct_color := momo_color
+    else
+        if momo > 0
+            direct_color := color_changer(momo_color, false)
+        else
+            direct_color := momo_color
+else
+    if delta > 0
+        if delta > delta[1]
+            direct_color := cd_up_over
+        else
+            direct_color := cd_up_under
+
+    else
+        if delta < delta[1]
+            direct_color := cd_down_under
+        else
+            direct_color := cd_down_over
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Ghost projection
+// ─────────────────────────────────────────────────────────────────────────────
+
+var float p_ma1 = na
+var float p_ma2 = na
+var float p_m1 = na
+var float p_m2 = na
+
+if enable_projection
+    p_ma1 := ma + ma_project
+    p_m1 := delta + projection
+    p_ma2 := ma + ma_project * 2
+    p_m2 := delta + projection * 2
+    var line project_delta = line.new(na, na, na, na, color = momentum_color, style = line.style_dotted)
+    var line project_ma = line.new(na, na, na, na, color = ma_color, style = line.style_dotted)
+    // One reusable linefill instead of a new one every bar.
+    var linefill project_fill = linefill.new(project_delta, project_ma, color(na))
+    project_ma.set_xy1(bar_index, ma)
+    project_ma.set_xy2(bar_index + 2, p_ma2)
+    project_delta.set_xy1(bar_index, delta)
+    project_delta.set_xy2(bar_index + 2, p_m2)
+    project_fill.set_color(color.new(p_ma2 > p_m2 ? ma_color : momentum_color, 90))
+
+float d1 = p_m1 - p_ma1
+float d2 = p_m2 - p_ma2
+
+color dc1 = na
+color dc2 = na
+
+if d1 > 0
+    if d1 > momo
+        dc1 := cd_up_over
+    else
+        dc1 := cd_up_under
+else
+    if d1 < momo
+        dc1 := cd_down_under
+    else
+        dc1 := cd_down_over
+
+if d2 > 0
+    if d2 > d1
+        dc2 := cd_up_over
+    else
+        dc2 := cd_up_under
+else
+    if d2 < d1
+        dc2 := cd_down_under
+    else
+        dc2 := cd_down_over
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Burst detection
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Burst strength: histogram size in standard deviations of its own recent history.
+float momo_dev = ta.stdev(momo, burst_length)
+float burst_z = momo_dev > 0 ? momo / momo_dev : 0.0
+float accel = momo - momo[1]
+float z_high = ta.highest(burst_z, max_lookback)
+float z_low = ta.lowest(burst_z, max_lookback)
+
+bool ghost_ok_bull = not require_ghost or (enable_projection and d2 > momo)
+bool ghost_ok_bear = not require_ghost or (enable_projection and d2 < momo)
+
+// Raw burst state: extended, still accelerating, aligned with momentum.
+bool bull_raw = enable_burst and burst_z > burst_threshold and accel > 0 and (not require_trend or delta > 0) and ghost_ok_bull
+bool bear_raw = enable_burst and burst_z < -burst_threshold and accel < 0 and (not require_trend or delta < 0) and ghost_ok_bear
+
+var int last_bull_bar = na
+var int last_bear_bar = na
+bool bull_burst = bull_raw and not bull_raw[1] and (na(last_bull_bar) or bar_index - last_bull_bar > burst_cooldown)
+bool bear_burst = bear_raw and not bear_raw[1] and (na(last_bear_bar) or bar_index - last_bear_bar > burst_cooldown)
+if bull_burst
+    last_bull_bar := bar_index
+if bear_burst
+    last_bear_bar := bar_index
+
+// MAX burst: first bar of a leg whose strength beats the prior lookback's extreme.
+var bool bull_leg_max = false
+var bool bear_leg_max = false
+if burst_z <= burst_threshold
+    bull_leg_max := false
+if burst_z >= -burst_threshold
+    bear_leg_max := false
+bool bull_max = bull_raw and burst_z > nz(z_high[1]) and not bull_leg_max
+bool bear_max = bear_raw and burst_z < nz(z_low[1]) and not bear_leg_max
+if bull_max
+    bull_leg_max := true
+if bear_max
+    bear_leg_max := true
+
+// Exhaustion: first bar the histogram turns against an extended burst.
+bool bull_exhaust = show_exhaustion and enable_burst and burst_z[1] > burst_threshold and momo < momo[1] and momo[1] >= momo[2]
+bool bear_exhaust = show_exhaustion and enable_burst and burst_z[1] < -burst_threshold and momo > momo[1] and momo[1] <= momo[2]
+
+// Ghost cross: projection flips the histogram's sign before the real histogram does.
+bool ghost_up = show_ghost_cross and enable_projection and ta.crossover(d2, 0) and momo < 0
+bool ghost_down = show_ghost_cross and enable_projection and ta.crossunder(d2, 0) and momo > 0
+
+bool momentum_cross_up = ta.crossover(delta, ma)
+bool momentum_cross_down = ta.crossunder(delta, ma)
+
+var string last_signal = "—"
+var int last_signal_bar = na
+if bull_burst or bull_max
+    last_signal := bull_max ? "MAX Bull Burst" : "Bull Burst"
+    last_signal_bar := bar_index
+if bear_burst or bear_max
+    last_signal := bear_max ? "MAX Bear Burst" : "Bear Burst"
+    last_signal_bar := bar_index
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Plots
+// ─────────────────────────────────────────────────────────────────────────────
+
+bgcolor(highlight_burst_bg and bull_raw ? color.new(cd_up_over, 90) : highlight_burst_bg and bear_raw ? color.new(cd_down_under, 90) : na, title = "Burst Background")
+
+hline(0)
+plot(momo, "Convergance Divergence", color.new(momo_color, cd_alpha), 5, glow ? plot.style_histogram : plot.style_columns)
+plot(glow ? momo : na, "Convergance Divergence Glow", color.new(momo_color, cd_alpha + (100 - cd_alpha) / 2), 1, plot.style_columns, display = display.pane)
+ma_plot = plot(ma, "MA", ma_color)
+plot(glow ? ma : na, "MA Glow", color.new(ma_color, 80), 4, display = display.pane)
+delta_plot = plot(delta, "Momentum", momentum_color)
+plot(glow ? delta : na, "Momentum Glow", color.new(momentum_color, 80), 4, display = display.pane)
+// Fill between the main lines so it also shows with Glow off.
+fill(ma_plot, delta_plot, color.new(delta > ma ? momentum_color : ma_color, 90), "Momentum Fill", editable = true)
+
+plot(d1, "Projected Delta", color.new(dc1, 60), 1, plot.style_columns, offset = 1, show_last = 1)
+plot(d2, "Projected Delta", color.new(dc2, 60), 1, plot.style_columns, offset = 2, show_last = 1)
+
+// Pane markers
+plotshape(bull_burst and not bull_max, "Bull Burst", shape.triangleup, location.bottom, cd_up_over, size = size.tiny, display = display.pane)
+plotshape(bear_burst and not bear_max, "Bear Burst", shape.triangledown, location.top, cd_down_under, size = size.tiny, display = display.pane)
+plotshape(bull_max, "MAX Bull Burst", shape.diamond, location.bottom, cd_up_over, size = size.small, text = "MAX", textcolor = cd_up_over, display = display.pane)
+plotshape(bear_max, "MAX Bear Burst", shape.diamond, location.top, cd_down_under, size = size.small, text = "MAX", textcolor = cd_down_under, display = display.pane)
+plotshape(bull_exhaust, "Bull Exhaustion", shape.xcross, location.top, cd_up_under, size = size.tiny, display = display.pane)
+plotshape(bear_exhaust, "Bear Exhaustion", shape.xcross, location.bottom, cd_down_over, size = size.tiny, display = display.pane)
+plotshape(ghost_up, "Ghost Cross Up", shape.circle, location.bottom, ghost_color, size = size.tiny, display = display.pane)
+plotshape(ghost_down, "Ghost Cross Down", shape.circle, location.top, ghost_color, size = size.tiny, display = display.pane)
+
+// Price chart markers
+plotshape(show_chart_signals and bull_burst and not bull_max, "Chart Bull Burst", shape.triangleup, location.belowbar, cd_up_over, size = size.tiny, force_overlay = true)
+plotshape(show_chart_signals and bear_burst and not bear_max, "Chart Bear Burst", shape.triangledown, location.abovebar, cd_down_under, size = size.tiny, force_overlay = true)
+plotshape(show_chart_signals and bull_max, "Chart MAX Bull", shape.labelup, location.belowbar, cd_up_over, text = "MAX", textcolor = color.black, size = size.tiny, force_overlay = true)
+plotshape(show_chart_signals and bear_max, "Chart MAX Bear", shape.labeldown, location.abovebar, cd_down_under, text = "MAX", textcolor = color.white, size = size.tiny, force_overlay = true)
+plotshape(show_chart_signals and bull_exhaust, "Chart Bull Exhaustion", shape.xcross, location.abovebar, cd_up_under, size = size.tiny, force_overlay = true)
+plotshape(show_chart_signals and bear_exhaust, "Chart Bear Exhaustion", shape.xcross, location.belowbar, cd_down_over, size = size.tiny, force_overlay = true)
+
+bar_color = switch candle_color_style
+    "MA" => momo_color
+    "Both" => direct_color
+    "Direct" => direct_color
+    "None" => color(na)
+
+if burst_candles and bull_raw
+    bar_color := cd_up_over
+if burst_candles and bear_raw
+    bar_color := cd_down_under
+
+barcolor(bar_color)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Dashboard
+// ─────────────────────────────────────────────────────────────────────────────
+
+string dash_position = switch dashboard_pos
+    "Top Left" => position.top_left
+    "Bottom Right" => position.bottom_right
+    "Bottom Left" => position.bottom_left
+    => position.top_right
+
+var table dash = table.new(dash_position, 2, 6, bgcolor = color.new(chart.bg_color, 10), border_color = color.new(chart.fg_color, 80), border_width = 1, frame_color = color.new(chart.fg_color, 70), frame_width = 1)
+
+dash_row(int row, string label, string value, color value_color)=>
+    dash.cell(0, row, label, text_color = chart.fg_color, text_halign = text.align_left, text_size = size.small)
+    dash.cell(1, row, value, text_color = value_color, text_halign = text.align_right, text_size = size.small)
+
+if show_dashboard and barstate.islast
+    string burst_state = bull_raw ? "BULL BURST" : bear_raw ? "BEAR BURST" : "Neutral"
+    color burst_state_color = bull_raw ? cd_up_over : bear_raw ? cd_down_under : chart.fg_color
+    string ghost_state = not enable_projection or na(d2) ? "Off" : d2 > momo ? "Expanding ▲" : "Contracting ▼"
+    color ghost_state_color = not enable_projection or na(d2) ? chart.fg_color : d2 > momo ? cd_up_over : cd_down_under
+    string last_text = na(last_signal_bar) ? last_signal : last_signal + " (" + str.tostring(bar_index - last_signal_bar) + " bars)"
+
+    dash_row(0, "Momentum", (delta > delta[1] ? "Rising ▲ " : "Falling ▼ ") + str.tostring(delta, format.mintick), delta > 0 ? cd_up_over : cd_down_under)
+    dash_row(1, "vs MA", delta > ma ? "Above" : "Below", delta > ma ? cd_up_over : cd_down_under)
+    dash_row(2, "Burst σ", str.tostring(burst_z, "#.##"), math.abs(burst_z) > burst_threshold ? burst_state_color : chart.fg_color)
+    dash_row(3, "State", burst_state, burst_state_color)
+    dash_row(4, "Ghost", ghost_state, ghost_state_color)
+    dash_row(5, "Last Signal", last_text, chart.fg_color)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Alerts
+// ─────────────────────────────────────────────────────────────────────────────
+
+alertcondition(bull_burst, "Bull Burst", "MBM: Bull momentum burst on {{ticker}} ({{interval}})")
+alertcondition(bear_burst, "Bear Burst", "MBM: Bear momentum burst on {{ticker}} ({{interval}})")
+alertcondition(bull_max, "MAX Bull Burst", "MBM: MAX bull momentum burst on {{ticker}} ({{interval}})")
+alertcondition(bear_max, "MAX Bear Burst", "MBM: MAX bear momentum burst on {{ticker}} ({{interval}})")
+alertcondition(bull_exhaust, "Bull Exhaustion", "MBM: Bull burst exhausting on {{ticker}} ({{interval}})")
+alertcondition(bear_exhaust, "Bear Exhaustion", "MBM: Bear burst exhausting on {{ticker}} ({{interval}})")
+alertcondition(ghost_up, "Ghost Cross Up", "MBM: Ghost projection turned bullish on {{ticker}} ({{interval}})")
+alertcondition(ghost_down, "Ghost Cross Down", "MBM: Ghost projection turned bearish on {{ticker}} ({{interval}})")
+alertcondition(momentum_cross_up, "Momentum Cross Up", "MBM: Momentum crossed above MA on {{ticker}} ({{interval}})")
+alertcondition(momentum_cross_down, "Momentum Cross Down", "MBM: Momentum crossed below MA on {{ticker}} ({{interval}})")
+
+// Single "Any alert() function call" alert covering every signal.
+if bull_max
+    alert("MAX Bull Burst on " + syminfo.ticker, alert.freq_once_per_bar_close)
+else if bull_burst
+    alert("Bull Burst on " + syminfo.ticker, alert.freq_once_per_bar_close)
+if bear_max
+    alert("MAX Bear Burst on " + syminfo.ticker, alert.freq_once_per_bar_close)
+else if bear_burst
+    alert("Bear Burst on " + syminfo.ticker, alert.freq_once_per_bar_close)
+if bull_exhaust
+    alert("Bull Exhaustion on " + syminfo.ticker, alert.freq_once_per_bar_close)
+if bear_exhaust
+    alert("Bear Exhaustion on " + syminfo.ticker, alert.freq_once_per_bar_close)
+if ghost_up
+    alert("Ghost Cross Up on " + syminfo.ticker, alert.freq_once_per_bar_close)
+if ghost_down
+    alert("Ghost Cross Down on " + syminfo.ticker, alert.freq_once_per_bar_close)
